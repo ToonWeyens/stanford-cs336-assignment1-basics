@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import BinaryIO
 from tqdm import tqdm
 
+# Note: Currently unused as pretokenization doesn't seem to be the biggest job
 def find_chunk_boundaries(
     file: BinaryIO,
     desired_num_chunks: int,
