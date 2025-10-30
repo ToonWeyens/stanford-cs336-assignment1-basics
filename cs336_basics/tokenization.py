@@ -1,7 +1,9 @@
 import os
+import pickle
 import regex as re
 
 from collections import Counter, defaultdict
+from pathlib import Path
 from typing import BinaryIO
 from tqdm import tqdm
 
@@ -145,12 +147,27 @@ def my_run_train_bpe(
     # make sure they're byte objects
     special_tokens_b = [s.encode("utf-8") if isinstance(s, str) else s for s in special_tokens]
 
+    cache_path = Path(input_path)
+    cache_path = cache_path.with_name(cache_path.name + ".pretoks.pkl")
 
-    data = read_bytes(input_path)
-    
-    if debug:
-        print("computing pretokens")
-    pretoks = build_pretokens(data, special_tokens_b)
+    if cache_path.exists():
+        if debug:
+            print(f"loading pretokens from {cache_path}")
+        with cache_path.open("rb") as f:
+            pretoks = pickle.load(f)
+    else:
+        data = read_bytes(input_path)
+
+        if debug:
+            print("computing pretokens")
+        pretoks = build_pretokens(data, special_tokens_b)
+
+        with cache_path.open("wb") as f:
+            pickle.dump(pretoks, f)
+
+        # Re-load from disk so downstream code always works with the cached artifact.
+        with cache_path.open("rb") as f:
+            pretoks = pickle.load(f)
 
     sym = SymTab()
     for s in special_tokens_b:
@@ -219,7 +236,7 @@ if __name__ == "__main__":
     from pathlib import Path
 
     # filename = Path("data") / "owt_valid.txt"
-    filename = Path("data") / "TinyStoriesV2-GPT4-valid.txt"
+    filename = Path("data") / "TinyStoriesV2-GPT4-train.txt"
     print(f"Using {filename} for tokenization")
 
     special_tokens = [b"<|endoftext|>",
@@ -228,4 +245,4 @@ if __name__ == "__main__":
                       b"<|fim_middle|>",
                       b"<|file_separator|>"]
 
-    vocab, merges = my_run_train_bpe(filename, 500, special_tokens)
+    vocab, merges = my_run_train_bpe(filename, 10000, special_tokens, debug=True)
