@@ -55,6 +55,28 @@ def _find_chunk_boundaries(
     # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
     return sorted(set(chunk_boundaries))
 
+# we use a linked list so we can automatically reference them in occ (see _build_indexes)
+class Node:
+    __slots__ = ("id", "prev", "next", "wi")
+    def __init__(self, sym_id: int, wi: int):
+        self.id = sym_id
+        self.prev = None     # type: Node | None
+        self.next = None     # type: Node | None
+        self.wi = wi         # word index (to access freqs)
+
+    def __hash__(self):
+        # allow putting Node into sets; identity semantics
+        return id(self)
+    
+    def __repr__(self):
+        left = self.prev.id if self.prev else None
+        right = self.next.id if self.next else None
+        return f"Node(id={self.id}, wi={self.wi}, prev={left}, next={right})"
+
+    __str__ = __repr__
+
+
+
 def _read_bytes(path):
     with open(path, "rb") as f:
         return f.read()
@@ -64,31 +86,51 @@ def _split_on_specials(data: bytes, special_tokens: list[bytes]) -> list[bytes]:
     return re.split(pattern, data)
 
 def _build_indexes(dataset):
-    # words[i]  -> mutable list of ids for word i
-    # freqs[i]  -> frequency of word i
-    # counts[(x,y)] -> total weighted count across all word pairs
-    # occ[(x,y)]    -> list of occurrence sites (word_index, position) where position goes from 0 to word length - 1
-    words = [list(seq) for seq, f in dataset]
+    """"
+    Build:
+        - words: list[Node | None]: head node of each word's linked list
+        - freqs: list[int]: frequency of word i
+        - counts: Counter[(int,int)]: weighted pair counts
+        - occ: dict[(int,int)]: set[Node] where Node is the LEFT node of the pair
+        - heap, ver: heap over (-count, pair, ver[pair]) with versions for lazy invalidation
+    """
+    words = [None] * len(dataset)
     freqs = [f for _, f in dataset]
     counts = Counter()
     occ = defaultdict(set)
 
-    for wi, s in enumerate(words):
-        if len(s) < 2:
+    # build linked lists per word and index pairs by left node
+    for wi, (seq, f) in enumerate(dataset):
+        if not seq:
             continue
-        f = freqs[wi]
-        for i in range(len(s) - 1):
-            p = (s[i], s[i+1])
-            counts[p] += f
-            occ[p].add((wi, i))
+        # create nodes
+        nodes = [Node(x, wi) for x in seq]
+        # link
+        for i in range(1, len(nodes)):
+            nodes[i-1].next = nodes[i]
+            nodes[i].prev = nodes[i-1]
+        words[wi] = nodes[0]
 
-    # Max-heap with lazy invalidation, meaning that the version will be incremented and the last version will be used
+        # index pairs
+        if len(nodes) >= 2:
+            n = nodes[0]
+            while n and n.next:
+                p = (n.id, n.next.id)
+                counts[p] += f
+                occ[p].add(n)   # left node is the site
+                n = n.next
+
+    # heap + versions
     heap = []
-    ver = {p: 0 for p in counts}       # version per pair
+    ver = {p: 0 for p in counts}
     for p, c in counts.items():
-        # take -counts because python's heapq is min-heap, not max, so smallest index is in position 0
         heapq.heappush(heap, (-c, p, ver[p]))
     return words, freqs, counts, occ, heap, ver
+
+def _get_occ_for_wi_from_list(occ_list, wi: int):
+    return [
+        node for node in occ_list if node.wi == wi
+    ]
 
 def _heap_push(pair, counts, ver, heap):
     ver[pair] = ver.get(pair, 0) + 1
@@ -125,14 +167,14 @@ def _inc(pair, f, counts, ver, heap):
     counts[pair] = counts.get(pair, 0) + f # lazily create
     _heap_push(pair, counts, ver, heap)
 
-def _occ_del(occ, pair, site):
+def _occ_del(occ, pair, left_node):
     s = occ.get(pair)
-    s.discard(site)
+    s.discard(left_node)
     if not s: # this pair stopped occuring completely
         occ.pop(pair, None)
 
-def _occ_add(occ, pair, site):
-    occ[pair].add(site)
+def _occ_add(occ, pair, left_node):
+    occ[pair].add(left_node)
 
 
 def _build_pretokens(data: bytes, special_tokens: list[bytes]) -> Counter[bytes]:
@@ -214,23 +256,11 @@ def _apply_merge(dataset,
 def train_bpe_incremental(dataset, sym, target_vocab_size, merges_out, debug=False):
     words, freqs, counts, occ, heap, ver = _build_indexes(dataset)
 
-    # Explanation:
-    #   words[i] is word converted to its byte integer, with i=0..(tot nr. of words)
-    #   freqs[i] is the corresponding frequency of each word
-    #   counts[(i,j)] is the total numer of times a pair (i,j) appears with i=0..(tot nr. of pairs)
-    #   occ[(i,j)] is the occurences where these pairs occur, indexed the same as counts
-    #   heap is a minheap containing tripples (-count, pair, version), one for each pair
-    #   ver is version, one for each pair
-    # where
-    #   tot nr. of pairs >> 255 but probably < 256^2
-    #   version is
-    #       initialized at 0
-    #       will be incremented later, so we don't have to overwrite (which is slow) and can compact periodically to release memory
-    #   We need version because heaps just add new values, which will almost always come after the old ones (count typically decreases)
-    #   I'm not entirely sure if counts could go up, but this is a safe implementation
-
     # ---------------------  merge loop  ---------------------
+    loopid=0
     while len(sym.id2seq) < target_vocab_size:
+        loopid+=1
+        print(f'LOOP {loopid}')
         # get best pair from heap; skip stale entries
         while heap:
             negc, pair, stamp = heapq.heappop(heap)
@@ -249,6 +279,9 @@ def train_bpe_incremental(dataset, sym, target_vocab_size, merges_out, debug=Fal
             return
 
         a, b = pair
+        if a==b:
+            print(f'weird corner case!!!!!!!!!!! {a,b}')
+
 
         # materialize merged token id
         merged_seq = sym.id2seq[a] + sym.id2seq[b]
@@ -265,46 +298,72 @@ def train_bpe_incremental(dataset, sym, target_vocab_size, merges_out, debug=Fal
 
         # pop the entry for this pair in occ
         # Later we will also modify the occ for neighbour pairs of each site
-        sites = occ.pop(pair, set())    # <<< set default
-        for site in sites:
-            print(f">> word 11660: {words[11660]}")
-            if len(words[11660])<6:
-                print(f">> word 11660 decreased in length")
-            if site is None:
-                raise RuntimeError(f"sites should never be None")
-            wi, i = site
-            s = words[wi]
+        sites = occ.pop(pair, set())
+        for left in list(sites):  # snapshot; we'll mutate structures
+
+            ########### TEST
+            # print('check if this is already corrupted')
+            # ssseq = dataset[left.wi][0]
+            # if any(x == y == 111 for x, y in zip(ssseq, ssseq[1:])):
+            #     print('first double id!!')
+            sites_ones = occ[(111,111)]
+            for l in list(sites_ones):
+                if l.id != 111 and l.next.id != 111:
+                    print(f">> {l.id}, {l.next.id}")
+            # print('done')
+            ########### TEST
+
+
+            if left.wi == 8067:
+                occ_for_this_node = _get_occ_for_wi_from_list(sites,8067)
+                print("left.wi was 8067, occ is calculated")
+            if left is None or left.next is None:
+                raise ValueError('left or left.next is None!')
+            # validate still (a,b) at this site
+            if left.id != a or left.next.id != b:
+                # THIS NEEDS TO BE DEBUGGED: IT LOOKS LIKE THE ORIGINAL DATASET (dataset[left.wi]) ALWAYS HAD 111,111.
+                # BUT 111, LEFT.NEXT.ID should NOT BE INSIDE OCC
+                # FOR WORD 371 we started with (32, 100, 111, 111, 114), as is in dataset still
+                # Now we have [281, 111, 308] because we merged 32+100 into 281 and 111+114 into 308
+                # This means that the end result should not appear in occ for [111,111] any more
+                raise ValueError(f'pair {(a,b)} does not agree with {(left.id, left.next.id)}')
+
+            right = left.next
+            L = left.prev
+            R = right.next
+            wi = left.wi
             f = freqs[wi]
 
-            # Validate still (a,b) at this location; if edits made it stale, skip.
-            if not (0 <= i < len(s)-1 and s[i] == a and s[i+1] == b):
-                # continue
-                raise RuntimeError(f"location {(i,i+1)} in word {s} did not contain pair {[a,b]}")
-
-            L = s[i-1] if i-1 >= 0 else None
-            R = s[i+2] if i+2 < len(s) else None
-
-            # old neighbors disappear at this site
-            print(f"removing stale neighbors of pair {pair}")
+            # decrement counts and remove old neighbor sites
             if L is not None:
-                _dec((L, a), f, counts, ver, heap)
-                _occ_del(occ, (L, a), (wi, i-1))   # move out
-            _dec((a, b), f, counts, ver, heap)     # whole pair already popped from occ
+                _dec((L.id, a), f, counts, ver, heap)
+                if not (L.id==a and a==b): # Only delete from occ if L,a is not the same as a,b because that's already popped
+                    _occ_del(occ, (L.id, a), L)
+            _dec((a, b), f, counts, ver, heap)
             if R is not None:
-                _dec((b, R), f, counts, ver, heap)
-                _occ_del(occ, (b, R), (wi, i+1))   # move out
+                _dec((b, R.id), f, counts, ver, heap)
+                if not (b==a and R.id==b): # Only delete from occ if b,R is not the same as a,b because that's already popped
+                    _occ_del(occ, (b, R.id), right)
 
-            # in-place merge inside the word
-            s[i:i+2] = [new_id]
-
-            # new neighbors appear at this site
-            print(f"adding new neighbors of pair {pair}")
+            # splice: replace [left(a), right(b)] with [new_id]
+            new_node = Node(new_id, wi)
+            new_node.prev, new_node.next = L, R
             if L is not None:
-                _inc((L, new_id), f, counts, ver, heap)
-                _occ_add(occ, (L, new_id), (wi, i-1))  # move in
+                L.next = new_node
+            else:
+                # left was head of this word
+                words[wi] = new_node
             if R is not None:
-                _inc((new_id, R), f, counts, ver, heap)
-                _occ_add(occ, (new_id, R), (wi, i))    # move in; right pair starts at i
+                R.prev = new_node
+
+            # increment counts and add new neighbor sites
+            if L is not None:
+                _inc((L.id, new_id), f, counts, ver, heap)
+                _occ_add(occ, (L.id, new_id), L)         # pair starts at L
+            if R is not None:
+                _inc((new_id, R.id), f, counts, ver, heap)
+                _occ_add(occ, (new_id, R.id), new_node)  # pair starts at new_node
+
 
         if debug:
             def b2s(tup):
@@ -364,60 +423,6 @@ def my_run_train_bpe(
     id2bytes = {i: bytes(seq) for i, seq in sym.id2seq.items()}
     return id2bytes, merges
 
-
-    if debug:
-        print("merging tokens")
-    pbar = tqdm(
-        total=vocab_size,
-        initial=len(sym.id2seq),
-        unit="items",
-        disable=not debug,
-    )
-    while len(sym.id2seq) < vocab_size:
-        pairs = _get_stats(dataset)
-        if not pairs:
-            break
-
-        # Match GPT-2 training tie-break behaviour: prefer the highest
-        # frequency, and when multiple pairs share the frequency choose the
-        # pair whose underlying byte sequence is lexicographically largest.
-        # This mirrors the reference implementation's deterministic ordering.
-        a, b = max(
-            pairs.items(),
-            key=lambda kv: (
-                kv[1],
-                sym.id2seq[kv[0][0]],
-                sym.id2seq[kv[0][1]],
-            ),
-        )[0]
-
-        # make/ensure merged symbol representing underlying bytes
-        merged_seq = sym.id2seq[a] + sym.id2seq[b] # adding tupples appends them
-        new_id = sym.add_symbol(merged_seq)
-
-        # record merge for output
-        merges.append((bytes(sym.id2seq[a]), bytes(sym.id2seq[b])))
-
-        # update dataset
-        ba = bytes(sym.id2seq[a])
-        bb = bytes(sym.id2seq[b])
-        bab = ba+bb
-        if debug:
-            a_repr = ba.decode("utf-8", errors="backslashreplace")
-            b_repr = bb.decode("utf-8", errors="backslashreplace")
-            merged_repr = bab.decode("utf-8", errors="backslashreplace")
-            print(
-                f"merging byte pair {a} ({a_repr}), {b} ({b_repr}) to ({merged_repr})"
-            )
-        dataset = _apply_merge(dataset, a, b, new_id)
-
-        pbar.update(1)
-
-    pbar.close()
-
-    id2bytes = {i: bytes(seq) for i, seq in sym.id2seq.items()}
-
-    return id2bytes, merges
 
 
 if __name__ == "__main__":
