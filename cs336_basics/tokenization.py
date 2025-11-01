@@ -127,11 +127,6 @@ def _build_indexes(dataset):
         heapq.heappush(heap, (-c, p, ver[p]))
     return words, freqs, counts, occ, heap, ver
 
-def _get_occ_for_wi_from_list(occ_list, wi: int):
-    return [
-        node for node in occ_list if node.wi == wi
-    ]
-
 def _heap_push(pair, counts, ver, heap):
     ver[pair] = ver.get(pair, 0) + 1
     c = counts.get(pair)
@@ -259,16 +254,13 @@ def train_bpe_incremental(dataset, sym, target_vocab_size, merges_out, debug=Fal
     # ---------------------  merge loop  ---------------------
     loopid=0
     while len(sym.id2seq) < target_vocab_size:
-        loopid+=1
-        print(f'LOOP {loopid}')
         # get best pair from heap; skip stale entries
         while heap:
             negc, pair, stamp = heapq.heappop(heap)
             # heap entry version is old
             if ver[pair] != stamp:
                 continue
-            # this should never happen, so let's error if it does
-            # it catches inconsisistencies
+            # this should never happen, so let's error if it does as it catches inconsisistencies
             c = -negc
             if counts.get(pair, 0) != c or c == 0:
                 # continue
@@ -279,9 +271,6 @@ def train_bpe_incremental(dataset, sym, target_vocab_size, merges_out, debug=Fal
             return
 
         a, b = pair
-        if a==b:
-            print(f'weird corner case!!!!!!!!!!! {a,b}')
-
 
         # materialize merged token id
         merged_seq = sym.id2seq[a] + sym.id2seq[b]
@@ -299,33 +288,17 @@ def train_bpe_incremental(dataset, sym, target_vocab_size, merges_out, debug=Fal
         # pop the entry for this pair in occ
         # Later we will also modify the occ for neighbour pairs of each site
         sites = occ.pop(pair, set())
-        for left in list(sites):  # snapshot; we'll mutate structures
-
-            ########### TEST
-            # print('check if this is already corrupted')
-            # ssseq = dataset[left.wi][0]
-            # if any(x == y == 111 for x, y in zip(ssseq, ssseq[1:])):
-            #     print('first double id!!')
-            sites_ones = occ[(111,111)]
-            for l in list(sites_ones):
-                if l.id != 111 and l.next.id != 111:
-                    print(f">> {l.id}, {l.next.id}")
-            # print('done')
-            ########### TEST
-
-
-            if left.wi == 8067:
-                occ_for_this_node = _get_occ_for_wi_from_list(sites,8067)
-                print("left.wi was 8067, occ is calculated")
+        sites_to_skip = set() # will contain corner cases, such as repeated characters, that need to be deleted
+        for left in sites:  # snapshot; we'll mutate structures
+            if left in sites_to_skip:
+                # This list will contain cases such as o,o,o where the second pair needs to be removed
+                # because it doesn't exist any more after the first pair was done
+                continue
+            
             if left is None or left.next is None:
-                raise ValueError('left or left.next is None!')
+                raise ValueError('left {left} or left.next {left.next} cannot be None!')
             # validate still (a,b) at this site
             if left.id != a or left.next.id != b:
-                # THIS NEEDS TO BE DEBUGGED: IT LOOKS LIKE THE ORIGINAL DATASET (dataset[left.wi]) ALWAYS HAD 111,111.
-                # BUT 111, LEFT.NEXT.ID should NOT BE INSIDE OCC
-                # FOR WORD 371 we started with (32, 100, 111, 111, 114), as is in dataset still
-                # Now we have [281, 111, 308] because we merged 32+100 into 281 and 111+114 into 308
-                # This means that the end result should not appear in occ for [111,111] any more
                 raise ValueError(f'pair {(a,b)} does not agree with {(left.id, left.next.id)}')
 
             right = left.next
@@ -337,12 +310,17 @@ def train_bpe_incremental(dataset, sym, target_vocab_size, merges_out, debug=Fal
             # decrement counts and remove old neighbor sites
             if L is not None:
                 _dec((L.id, a), f, counts, ver, heap)
-                if not (L.id==a and a==b): # Only delete from occ if L,a is not the same as a,b because that's already popped
+                if L.id==a and a==b: # remove from current sites, not occ
+                    sites_to_skip.add(left.prev)
+                else:
                     _occ_del(occ, (L.id, a), L)
+
             _dec((a, b), f, counts, ver, heap)
             if R is not None:
                 _dec((b, R.id), f, counts, ver, heap)
-                if not (b==a and R.id==b): # Only delete from occ if b,R is not the same as a,b because that's already popped
+                if b==a and R.id==b: # remove from current sites, not occ
+                    sites_to_skip.add(right)
+                else:
                     _occ_del(occ, (b, R.id), right)
 
             # splice: replace [left(a), right(b)] with [new_id]
@@ -368,9 +346,11 @@ def train_bpe_incremental(dataset, sym, target_vocab_size, merges_out, debug=Fal
         if debug:
             def b2s(tup):
                 return bytes(tup).decode("utf-8", errors="backslashreplace")
-            print(f"merge ({a},{b}) -> new_id={new_id} "
+            print(f"LOOP {loopid} - merge ({a},{b}) -> new_id={new_id} "
                   f"[{b2s(sym.id2seq[a])}+{b2s(sym.id2seq[b])}={b2s(merged_seq)}] "
                   f"distinct_pairs={len(counts)}")
+        
+        loopid+=1
 
 
 def my_run_train_bpe(
