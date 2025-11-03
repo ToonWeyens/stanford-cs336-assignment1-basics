@@ -80,6 +80,25 @@ class Node:
 
 
 
+class _DescendingSeq:
+    """Wrap sequence tuples so the heap prefers lexicographically larger ones."""
+
+    __slots__ = ("seq",)
+
+    def __init__(self, seq: tuple[int, ...]):
+        self.seq = seq
+
+    def __lt__(self, other: "_DescendingSeq") -> bool:
+        if not isinstance(other, _DescendingSeq):
+            return NotImplemented
+        return self.seq > other.seq
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, _DescendingSeq):
+            return NotImplemented
+        return self.seq == other.seq
+
+
 def _read_bytes(path):
     with open(path, "rb") as f:
         return f.read()
@@ -88,7 +107,7 @@ def _split_on_specials(data: bytes, special_tokens: list[bytes]) -> list[bytes]:
     pattern = b"|".join(re.escape(tok) for tok in special_tokens)
     return re.split(pattern, data)
 
-def _build_indexes(dataset):
+def _build_indexes(dataset, sym):
     """"
     Build:
         - words: list[Node | None]: head node of each word's linked list
@@ -127,12 +146,18 @@ def _build_indexes(dataset):
 
     # heap + versions
     heap = []
-    ver = {p: 0 for p in counts}
+    ver = {}
     for p, c in counts.items():
-        heapq.heappush(heap, (-c, -p[0], -p[1], ver[p]))
+        ver[p] = 0
+        seq_left = sym.id2seq[p[0]]
+        seq_right = sym.id2seq[p[1]]
+        heapq.heappush(
+            heap,
+            (-c, _DescendingSeq(seq_left), _DescendingSeq(seq_right), ver[p], p),
+        )
     return words, freqs, counts, occ, heap, ver
 
-def _heap_push(pair, counts, ver, heap):
+def _heap_push(pair, counts, ver, heap, sym):
     ver[pair] = ver.get(pair, 0) + 1
     c = counts.get(pair)
     if c is None:
@@ -141,9 +166,14 @@ def _heap_push(pair, counts, ver, heap):
         raise RuntimeError(f"Trying to push to heap pair {pair} with version {ver[pair]} with negative count {c}")
     # print(f'Pushed new entry {(-c, pair, ver[pair])} to heap')
 
-    heapq.heappush(heap, (-c, -pair[0], -pair[1], ver[pair]))
+    seq_left = sym.id2seq[pair[0]]
+    seq_right = sym.id2seq[pair[1]]
+    heapq.heappush(
+        heap,
+        (-c, _DescendingSeq(seq_left), _DescendingSeq(seq_right), ver[pair], pair),
+    )
 
-def _dec(pair, f, counts, ver, heap):
+def _dec(pair, f, counts, ver, heap, sym):
     # print(f"decreasing pair {pair} by {f}")
     if f == 0: 
         raise RuntimeError(f"Tried decreasing counts for pair {pair} by 0 which is not possible")
@@ -158,14 +188,14 @@ def _dec(pair, f, counts, ver, heap):
     # elif counts[pair] < 0:
     if counts[pair] < 0:
         raise RuntimeError(f"Tried decreasing counts for pair {pair} by {f} to {counts[pair]}")
-    _heap_push(pair, counts, ver, heap)
+    _heap_push(pair, counts, ver, heap, sym)
 
-def _inc(pair, f, counts, ver, heap):
+def _inc(pair, f, counts, ver, heap, sym):
     # print(f"increasing pair {pair} by {f}")
     if f == 0: 
         raise RuntimeError(f"Tried increasing counts for pair {pair} by 0 which is not possible")
     counts[pair] = counts.get(pair, 0) + f # lazily create
-    _heap_push(pair, counts, ver, heap)
+    _heap_push(pair, counts, ver, heap, sym)
 
 def _occ_del(occ, pair, left_node):
     s = occ.get(pair)
@@ -225,23 +255,20 @@ def _make_dataset(
 
 
 def train_bpe_incremental(dataset, sym, target_vocab_size, merges_out, debug=False):
-    words, freqs, counts, occ, heap, ver = _build_indexes(dataset)
+    words, freqs, counts, occ, heap, ver = _build_indexes(dataset, sym)
 
     # ---------------------  merge loop  ---------------------
     loopid=0
     while len(sym.id2seq) < target_vocab_size:
         # get best pair from heap; skip stale entries
         while heap:
-            negc, negp1, negp2, stamp = heapq.heappop(heap)
-            # set pair
-            pair = (-negp1, -negp2)
+            negc, _seq_left, _seq_right, stamp, pair = heapq.heappop(heap)
             # heap entry version is old
-            if ver[pair] != stamp:
+            if ver.get(pair) != stamp:
                 continue
-            # this should never happen, so let's error if it does as it catches inconsisistencies
+            # this should never happen, so let's error if it does as it catches inconsistencies
             c = -negc
             if counts.get(pair, 0) != c or c == 0:
-                # continue
                 raise RuntimeError(f"Heap invariant broken for pair {pair}: stored {c}, real {counts.get(pair, 0)}")
             break
         else:
@@ -295,15 +322,15 @@ def train_bpe_incremental(dataset, sym, target_vocab_size, merges_out, debug=Fal
 
             # decrement counts and remove old neighbor sites
             if L is not None:
-                _dec((L.id, a), f, counts, ver, heap)
+                _dec((L.id, a), f, counts, ver, heap, sym)
                 if L.id==a and a==b: # remove from current sites, not occ
                     sites_to_skip.add(left.prev)
                 else:
                     _occ_del(occ, (L.id, a), L)
 
-            _dec((a, b), f, counts, ver, heap)
+            _dec((a, b), f, counts, ver, heap, sym)
             if R is not None:
-                _dec((b, R.id), f, counts, ver, heap)
+                _dec((b, R.id), f, counts, ver, heap, sym)
                 if b==a and R.id==b: # remove from current sites, not occ
                     sites_to_skip.add(right)
                 else:
@@ -323,10 +350,10 @@ def train_bpe_incremental(dataset, sym, target_vocab_size, merges_out, debug=Fal
 
             # increment counts and add new neighbor sites
             if L is not None:
-                _inc((L.id, new_id), f, counts, ver, heap)
+                _inc((L.id, new_id), f, counts, ver, heap, sym)
                 _occ_add(occ, (L.id, new_id), L)         # pair starts at L
             if R is not None:
-                _inc((new_id, R.id), f, counts, ver, heap)
+                _inc((new_id, R.id), f, counts, ver, heap, sym)
                 _occ_add(occ, (new_id, R.id), new_node)  # pair starts at new_node
 
 
