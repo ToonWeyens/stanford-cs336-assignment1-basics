@@ -59,12 +59,13 @@ def _find_chunk_boundaries(
 
 # we use a linked list so we can automatically reference them in occ (see _build_indexes)
 class Node:
-    __slots__ = ("id", "prev", "next", "wi")
+    __slots__ = ("id", "prev", "next", "wi", "pos")
     def __init__(self, sym_id: int, wi: int):
         self.id = sym_id
         self.prev = None     # type: Node | None
         self.next = None     # type: Node | None
         self.wi = wi         # word index (to access freqs)
+        self.pos = None       # position within word (to be able to sort left to right)
 
     def __hash__(self):
         # allow putting Node into sets; identity semantics
@@ -73,7 +74,7 @@ class Node:
     def __repr__(self):
         left = self.prev.id if self.prev else None
         right = self.next.id if self.next else None
-        return f"Node(id={self.id}, wi={self.wi}, prev={left}, next={right})"
+        return f"Node(id={self.id}, wi={self.wi} (pos {self.pos}), prev={left}, next={right})"
 
     __str__ = __repr__
 
@@ -108,6 +109,8 @@ def _build_indexes(dataset):
         # create nodes
         nodes = [Node(x, wi) for x in seq]
         # link
+        for i in range(len(nodes)):
+            nodes[i].pos = i
         for i in range(1, len(nodes)):
             nodes[i-1].next = nodes[i]
             nodes[i].prev = nodes[i-1]
@@ -264,14 +267,20 @@ def train_bpe_incremental(dataset, sym, target_vocab_size, merges_out, debug=Fal
 
         # pop the entry for this pair in occ
         # Later we will also modify the occ for neighbour pairs of each site
-        sites = occ.pop(pair, set())
+        sites_list = list(occ.pop(pair, set()))
+        sites = sorted(
+            sites_list, 
+            key=lambda node: (node.wi, node.pos)
+        )
+
         sites_to_skip = set() # will contain corner cases, such as repeated characters, that need to be deleted
+        
         for left in sites:  # snapshot; we'll mutate structures
             if left in sites_to_skip:
                 # This list will contain cases such as o,o,o where the second pair needs to be removed
                 # because it doesn't exist any more after the first pair was done
                 continue
-            
+
             if left is None or left.next is None:
                 raise ValueError('left {left} or left.next {left.next} cannot be None!')
             # validate still (a,b) at this site
@@ -303,6 +312,7 @@ def train_bpe_incremental(dataset, sym, target_vocab_size, merges_out, debug=Fal
             # splice: replace [left(a), right(b)] with [new_id]
             new_node = Node(new_id, wi)
             new_node.prev, new_node.next = L, R
+            new_node.pos = left.pos
             if L is not None:
                 L.next = new_node
             else:
