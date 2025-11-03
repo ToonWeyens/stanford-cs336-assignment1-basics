@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import BinaryIO
 from tqdm import tqdm
 
+from datetime import datetime
+
 # Note: Currently unused as pretokenization doesn't seem to be the biggest job
 def _find_chunk_boundaries(
     file: BinaryIO,
@@ -124,7 +126,7 @@ def _build_indexes(dataset):
     heap = []
     ver = {p: 0 for p in counts}
     for p, c in counts.items():
-        heapq.heappush(heap, (-c, p, ver[p]))
+        heapq.heappush(heap, (-c, -p[0], -p[1], ver[p]))
     return words, freqs, counts, occ, heap, ver
 
 def _heap_push(pair, counts, ver, heap):
@@ -136,7 +138,7 @@ def _heap_push(pair, counts, ver, heap):
         raise RuntimeError(f"Trying to push to heap pair {pair} with version {ver[pair]} with negative count {c}")
     # print(f'Pushed new entry {(-c, pair, ver[pair])} to heap')
 
-    heapq.heappush(heap, (-c, pair, ver[pair]))
+    heapq.heappush(heap, (-c, -pair[0], -pair[1], ver[pair]))
 
 def _dec(pair, f, counts, ver, heap):
     # print(f"decreasing pair {pair} by {f}")
@@ -217,35 +219,6 @@ def _make_dataset(
         dataset.append(pretok_with_freq)
     return dataset
 
-def _get_stats(dataset):
-    pairs = defaultdict(int)
-    for word, freq in dataset:
-        if len(word) < 2:
-            continue
-        for a, b in zip(word, word[1:]):
-            pairs[(a,b)] += freq
-    return pairs
-
-def _apply_merge(dataset,
-                a:int,
-                b: int,
-                new_id: int
-    ) -> list[tuple[tuple[int, ...], int]]: 
-    out = []
-    for seq, f in dataset:
-        i = 0
-        n = len(seq)
-        buf = []
-        while i < n:
-            if i + 1 < n and seq[i] == a and seq[i+1] == b:
-                buf.append(new_id)
-                i += 2
-            else:
-                buf.append(seq[i])
-                i += 1
-        out.append((tuple(buf), f))
-    return out
-
 
 
 def train_bpe_incremental(dataset, sym, target_vocab_size, merges_out, debug=False):
@@ -256,7 +229,9 @@ def train_bpe_incremental(dataset, sym, target_vocab_size, merges_out, debug=Fal
     while len(sym.id2seq) < target_vocab_size:
         # get best pair from heap; skip stale entries
         while heap:
-            negc, pair, stamp = heapq.heappop(heap)
+            negc, negp1, negp2, stamp = heapq.heappop(heap)
+            # set pair
+            pair = (-negp1, -negp2)
             # heap entry version is old
             if ver[pair] != stamp:
                 continue
@@ -276,6 +251,8 @@ def train_bpe_incremental(dataset, sym, target_vocab_size, merges_out, debug=Fal
         merged_seq = sym.id2seq[a] + sym.id2seq[b]
         new_id = sym.add_symbol(merged_seq)
         merges_out.append((bytes(sym.id2seq[a]), bytes(sym.id2seq[b])))
+
+        # ---------------------  affected occurence loop  ---------------------
 
         # --------- key picture for every site (w,i) where (a,b) occurs ----------
         # Before:      [ ...  L |  a  b  |  R  ... ]
@@ -352,6 +329,30 @@ def train_bpe_incremental(dataset, sym, target_vocab_size, merges_out, debug=Fal
         
         loopid+=1
 
+    if debug:
+        # check if for all places with count 0 we also have no occurences left
+        for pair in counts.keys():
+            if counts[pair] == 0:
+                if occ[pair]:
+                    raise RuntimeError(f"for pair {pair} the count was {counts[pair]} but occurences was nonzero: {occ[pair]}")
+
+        # check if for all places with no occurences we also have no count zero
+        for pair in occ.keys():
+            if not occ[pair]:
+                if counts[pair] > 0:
+                    raise RuntimeError(f"for pair {pair} the count was {counts[pair]} but occurences was nonzero: {occ[pair]}")
+        
+        # print the tokens
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        id2seq_output_file = f"output_id2seq_{timestamp}.txt"
+
+        with open(id2seq_output_file, "wb") as f:
+            for id, seq in sym.id2seq.items():
+                f.write(f"id {id} - seq {bytes(seq)} ({seq})\n".encode("utf-8"))
+
+
+    return
+
 
 def my_run_train_bpe(
     input_path: str | os.PathLike,
@@ -401,6 +402,7 @@ def my_run_train_bpe(
         print("merging tokens (indexed)")
     train_bpe_incremental(dataset, sym, vocab_size, merges_out=merges, debug=debug)
     id2bytes = {i: bytes(seq) for i, seq in sym.id2seq.items()}
+    
     return id2bytes, merges
 
 
@@ -420,3 +422,5 @@ if __name__ == "__main__":
                       b"<|file_separator|>"]
 
     vocab, merges = my_run_train_bpe(filename, 10000, special_tokens, debug=True)
+
+    print('done')
