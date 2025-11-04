@@ -449,7 +449,9 @@ if __name__ == "__main__":
 
     # filename = Path("data") / "owt_valid.txt"
     # filename = Path("data") / "TinyStoriesV2-GPT4-train.txt"
-    filename = Path("data") / "TinyStoriesV2-GPT4-valid.txt"
+    # filename = Path("data") / "TinyStoriesV2-GPT4-valid.txt"
+    # filename = Path("data") / "owt_valid.txt"
+    filename = Path("data") / "owt_train.txt"
     print(f"Using {filename} for tokenization")
 
     special_tokens = [b"<|endoftext|>",
@@ -458,6 +460,19 @@ if __name__ == "__main__":
                       b"<|fim_middle|>",
                       b"<|file_separator|>"]
 
-    vocab, merges = my_run_train_bpe(filename, 10000, special_tokens, debug=True)
+    vocab, merges = my_run_train_bpe(filename, 32000, special_tokens, debug=True)
+
+    # print the vocab and the merges
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    vocab_output_file = f"output_vocab_{timestamp}.txt"
+    merges_output_file = f"output_merges_{timestamp}.txt"
+
+    with open(vocab_output_file, "wb") as f:
+        for id, v in vocab.items():
+            f.write(f"{id} - {v}\n".encode("utf-8"))
+
+    with open(merges_output_file, "wb") as f:
+        for id, merge in enumerate(merges):
+            f.write(f"{id} - {merge}\n".encode("utf-8"))
 
     print('done')
