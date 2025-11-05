@@ -1,14 +1,46 @@
+import argparse
+import logging
 import os
 import pickle
 import regex as re
 import heapq
 
 from collections import Counter, defaultdict
+from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO
 from tqdm import tqdm
 
-from datetime import datetime
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
+
+DEFAULT_SPECIAL_TOKENS = [
+    "<|endoftext|>",
+    "<|fim_prefix|>",
+    "<|fim_suffix|>",
+    "<|fim_middle|>",
+    "<|file_separator|>",
+]
+
+
+def _ensure_logging_configured(level: int, log_file: Path | None = None) -> None:
+    """Configure root logging once, defaulting to a file handler for this CLI."""
+    root_logger = logging.getLogger()
+    if root_logger.handlers:
+        return
+
+    handlers: list[logging.Handler] = []
+    if log_file:
+        log_path = Path(log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.FileHandler(log_path, encoding="utf-8"))
+    handlers.append(logging.StreamHandler())
+
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=handlers,
+    )
 
 # Note: Currently unused as pretokenization doesn't seem to be the biggest job
 def _find_chunk_boundaries(
@@ -102,6 +134,11 @@ class _DescendingSeq:
 def _read_bytes(path):
     with open(path, "rb") as f:
         return f.read()
+
+
+def _default_pretoken_cache_path(input_path: Path) -> Path:
+    stem = Path(input_path).stem
+    return Path(f"output_{stem}_pretoks.pkl")
     
 def _split_on_specials(data: bytes, special_tokens: list[bytes]) -> list[bytes]:
     pattern = b"|".join(re.escape(tok) for tok in special_tokens)
@@ -248,7 +285,7 @@ def _make_dataset(
         pretok_with_freq = (tuple(tok), freq)
         if debug_output:
             printable = tok.decode("utf-8", errors="backslashreplace")
-            print(f"tok {printable}  - freq {freq}: {pretok_with_freq}")
+            logger.debug("Pretoken %s freq=%s as tuple=%s", printable, freq, pretok_with_freq)
         dataset.append(pretok_with_freq)
     return dataset
 
@@ -272,7 +309,8 @@ def train_bpe_incremental(dataset, sym, target_vocab_size, merges_out, debug=Fal
                 raise RuntimeError(f"Heap invariant broken for pair {pair}: stored {c}, real {counts.get(pair, 0)}")
             break
         else:
-            if debug: print("no more pairs")
+            if debug:
+                logger.debug("No more pairs to merge; stopping early at vocab size %s", len(sym.id2seq))
             return
 
         a, b = pair
@@ -360,9 +398,17 @@ def train_bpe_incremental(dataset, sym, target_vocab_size, merges_out, debug=Fal
         if debug:
             def b2s(tup):
                 return bytes(tup).decode("utf-8", errors="backslashreplace")
-            print(f"LOOP {loopid} - merge ({a},{b}) -> new_id={new_id} "
-                  f"[{b2s(sym.id2seq[a])}+{b2s(sym.id2seq[b])}={b2s(merged_seq)}] "
-                  f"distinct_pairs={len(counts)}")
+            logger.debug(
+                "loop=%s merge=(%s,%s)->%s [%s+%s=%s] distinct_pairs=%s",
+                loopid,
+                a,
+                b,
+                new_id,
+                b2s(sym.id2seq[a]),
+                b2s(sym.id2seq[b]),
+                b2s(merged_seq),
+                len(counts),
+            )
         
         loopid+=1
 
@@ -378,15 +424,6 @@ def train_bpe_incremental(dataset, sym, target_vocab_size, merges_out, debug=Fal
             if not occ[pair]:
                 if counts[pair] > 0:
                     raise RuntimeError(f"for pair {pair} the count was {counts[pair]} but occurences was nonzero: {occ[pair]}")
-        
-        # print the tokens
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        id2seq_output_file = f"output_id2seq_{timestamp}.txt"
-
-        with open(id2seq_output_file, "wb") as f:
-            for id, seq in sym.id2seq.items():
-                f.write(f"id {id} - seq {bytes(seq)} ({seq})\n".encode("utf-8"))
-
 
     return
 
@@ -399,27 +436,28 @@ def my_run_train_bpe(
     debug: bool = False,
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
 
+    input_path = Path(input_path)
+    _ensure_logging_configured(logging.DEBUG if debug else logging.INFO)
+
     # make sure they're byte objects
     special_tokens_b = [s.encode("utf-8") if isinstance(s, str) else s for s in special_tokens]
 
     # (1) pretokenize
-    cache_path = Path(input_path)
-    cache_path = cache_path.with_name(cache_path.name + ".pretoks.pkl")
-
+    cache_path = _default_pretoken_cache_path(input_path)
     if cache_path.exists():
-        if debug:
-            print(f"loading pretokens from {cache_path}")
+        logger.info("Loading pretokens from %s", cache_path)
         with cache_path.open("rb") as f:
             pretoks = pickle.load(f)
     else:
-        data = _read_bytes(input_path)
+        logger.info("Computing pretokens for %s", input_path)
+        data = _read_bytes(str(input_path))
 
-        if debug:
-            print("computing pretokens")
         pretoks = _build_pretokens(data, special_tokens_b)
 
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
         with cache_path.open("wb") as f:
             pickle.dump(pretoks, f)
+        logger.info("Cached pretokens to %s", cache_path)
 
         # Re-load from disk so downstream code always works with the cached artifact.
         with cache_path.open("rb") as f:
@@ -436,43 +474,98 @@ def my_run_train_bpe(
     merges: list[tuple[bytes, bytes]] = []
 
     if debug:
-        print("merging tokens (indexed)")
+        logger.debug("Merging tokens (indexed)")
     train_bpe_incremental(dataset, sym, vocab_size, merges_out=merges, debug=debug)
     id2bytes = {i: bytes(seq) for i, seq in sym.id2seq.items()}
     
     return id2bytes, merges
 
 
+def _parse_cli_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train a BPE tokenizer.")
+    default_input = Path("data") / "owt_train.txt"
+    parser.add_argument(
+        "--input",
+        type=Path,
+        default=default_input,
+        help=f"Training corpus (default: {default_input})",
+    )
+    parser.add_argument(
+        "--vocab-size",
+        type=int,
+        default=32000,
+        help="Target vocabulary size (default: 32000).",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("."),
+        help="Directory to store tokenizer artifacts (default: current directory).",
+    )
+    parser.add_argument(
+        "--special-token",
+        action="append",
+        dest="special_tokens",
+        help="Additional special token to include. Repeatable; defaults to GPT-2 tokens.",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable verbose debug logging and invariants.",
+    )
+    return parser.parse_args()
+
 
 if __name__ == "__main__":
-    from pathlib import Path
-
-    # filename = Path("data") / "owt_valid.txt"
-    # filename = Path("data") / "TinyStoriesV2-GPT4-train.txt"
-    # filename = Path("data") / "TinyStoriesV2-GPT4-valid.txt"
-    # filename = Path("data") / "owt_valid.txt"
-    filename = Path("data") / "owt_train.txt"
-    print(f"Using {filename} for tokenization")
-
-    special_tokens = [b"<|endoftext|>",
-                      b"<|fim_prefix|>",
-                      b"<|fim_suffix|>",
-                      b"<|fim_middle|>",
-                      b"<|file_separator|>"]
-
-    vocab, merges = my_run_train_bpe(filename, 32000, special_tokens, debug=True)
-
-    # print the vocab and the merges
+    args = _parse_cli_args()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    vocab_output_file = f"output_vocab_{timestamp}.txt"
-    merges_output_file = f"output_merges_{timestamp}.txt"
+    input_stem = Path(args.input).stem
+    artifact_prefix = f"output_{input_stem}_{timestamp}"
+    output_dir = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_file = output_dir / f"{artifact_prefix}.log"
+
+    _ensure_logging_configured(
+        logging.DEBUG if args.debug else logging.INFO,
+        log_file=log_file,
+    )
+    logger.info("Writing logs to %s", log_file)
+
+    special_tokens = DEFAULT_SPECIAL_TOKENS.copy()
+    if args.special_tokens:
+        special_tokens.extend(args.special_tokens)
+
+    logger.info("Using %s for tokenization", args.input)
+    vocab, merges = my_run_train_bpe(
+        args.input,
+        args.vocab_size,
+        special_tokens,
+        debug=args.debug,
+    )
+
+    vocab_output_file = output_dir / f"{artifact_prefix}_vocab.txt"
+    merges_output_file = output_dir / f"{artifact_prefix}_merges.txt"
+    vocab_pickle_file = output_dir / f"{artifact_prefix}_vocab.pkl"
+    merges_pickle_file = output_dir / f"{artifact_prefix}_merges.pkl"
 
     with open(vocab_output_file, "wb") as f:
         for id, v in vocab.items():
             f.write(f"{id} - {v}\n".encode("utf-8"))
+    logger.info("Wrote vocab dump to %s", vocab_output_file)
 
     with open(merges_output_file, "wb") as f:
         for id, merge in enumerate(merges):
             f.write(f"{id} - {merge}\n".encode("utf-8"))
+    logger.info("Wrote merges dump to %s", merges_output_file)
 
-    print('done')
+    with open(vocab_pickle_file, "wb") as f:
+        pickle.dump(vocab, f)
+    with open(merges_pickle_file, "wb") as f:
+        pickle.dump(merges, f)
+    logger.info(
+        "Persisted reusable vocab/merges pickles to %s and %s",
+        vocab_pickle_file,
+        merges_pickle_file,
+    )
+
+    logger.info("Done")
