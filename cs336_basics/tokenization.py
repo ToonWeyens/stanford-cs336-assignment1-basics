@@ -121,13 +121,13 @@ class _DescendingSeq:
         self.seq = seq
 
     def __lt__(self, other: "_DescendingSeq") -> bool:
-        if not isinstance(other, _DescendingSeq):
-            return NotImplemented
+        # if not isinstance(other, _DescendingSeq):
+        #     return NotImplemented
         return self.seq > other.seq
 
     def __eq__(self, other: object) -> bool:
-        if not isinstance(other, _DescendingSeq):
-            return NotImplemented
+        # if not isinstance(other, _DescendingSeq):
+        #     return NotImplemented
         return self.seq == other.seq
 
 
@@ -296,6 +296,8 @@ def train_bpe_incremental(dataset, sym, target_vocab_size, merges_out, debug=Fal
 
     # ---------------------  merge loop  ---------------------
     loopid=0
+    pbar = tqdm(total=target_vocab_size, initial=len(sym.id2seq))
+
     while len(sym.id2seq) < target_vocab_size:
         # get best pair from heap; skip stale entries
         while heap:
@@ -411,6 +413,8 @@ def train_bpe_incremental(dataset, sym, target_vocab_size, merges_out, debug=Fal
             )
         
         loopid+=1
+        pbar.update(1)
+    pbar.close()
 
     if debug:
         # check if for all places with count 0 we also have no occurences left
@@ -445,11 +449,11 @@ def my_run_train_bpe(
     # (1) pretokenize
     cache_path = _default_pretoken_cache_path(input_path)
     if cache_path.exists():
-        logger.info("Loading pretokens from %s", cache_path)
+        logger.info("(1) Loading pretokens from %s", cache_path)
         with cache_path.open("rb") as f:
             pretoks = pickle.load(f)
     else:
-        logger.info("Computing pretokens for %s", input_path)
+        logger.info("(1) Computing pretokens for %s", input_path)
         data = _read_bytes(str(input_path))
 
         pretoks = _build_pretokens(data, special_tokens_b)
@@ -464,6 +468,7 @@ def my_run_train_bpe(
             pretoks = pickle.load(f)
 
     # (2) set up dataset
+    logger.info("(2) Set up dataset")
     sym = SymTab()
     for s in special_tokens_b:
         sym.add_symbol(tuple(s))
@@ -471,10 +476,9 @@ def my_run_train_bpe(
     dataset = _make_dataset(pretoks, debug_output=debug)
 
     # (3) run merge algorithm
+    logger.info("(3) Run merge")
     merges: list[tuple[bytes, bytes]] = []
 
-    if debug:
-        logger.debug("Merging tokens (indexed)")
     train_bpe_incremental(dataset, sym, vocab_size, merges_out=merges, debug=debug)
     id2bytes = {i: bytes(seq) for i, seq in sym.id2seq.items()}
     
